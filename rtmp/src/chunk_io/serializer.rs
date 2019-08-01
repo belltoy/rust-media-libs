@@ -270,11 +270,15 @@ fn get_header_format(current_header: &mut ChunkHeader, previous_header: &ChunkHe
         return ChunkHeaderFormat::TimeDeltaWithoutMessageStreamId;
     }
 
-    if current_header.timestamp_delta != previous_header.timestamp_delta {
-        return ChunkHeaderFormat::TimeDeltaOnly;
+    if current_header.timestamp == previous_header.timestamp {
+        return ChunkHeaderFormat::Empty;
     }
 
-    ChunkHeaderFormat::Empty
+    if current_header.timestamp_delta == previous_header.timestamp_delta {
+        return ChunkHeaderFormat::Empty;
+    }
+
+    ChunkHeaderFormat::TimeDeltaOnly
 }
 
 #[cfg(test)]

@@ -57,7 +57,7 @@ fn can_accept_connection_request() {
         _ => panic!("First event was not as expected: {:?}", events[0]),
     };
 
-    let accept_results = session.accept_request(request_id).unwrap();
+    let accept_results = session.accept_request(request_id).unwrap().into_iter().map(ServerSessionResult::OutboundResponse).collect::<Vec<_>>();
     assert_eq!(accept_results.len(), 1, "Unexpected number of results returned");
 
     let (responses, _) = split_results(&mut deserializer, accept_results);
@@ -129,7 +129,7 @@ fn accepted_connection_responds_with_same_object_encoding_value_as_connection_re
         _ => panic!("First event was not as expected: {:?}", events[0]),
     };
 
-    let accept_results = session.accept_request(request_id).unwrap();
+    let accept_results = session.accept_request(request_id).unwrap().into_iter().map(ServerSessionResult::OutboundResponse).collect::<Vec<_>>();
     assert_eq!(accept_results.len(), 1, "Unexpected number of results returned");
 
     let (responses, _) = split_results(&mut deserializer, accept_results);
@@ -236,7 +236,7 @@ fn can_accept_live_publishing_to_requested_stream_key() {
         _ => panic!("Unexpected first event found: {:?}", events[0]),
     };
 
-    let accept_results = session.accept_request(request_id).unwrap();
+    let accept_results = session.accept_request(request_id).unwrap().into_iter().map(ServerSessionResult::OutboundResponse).collect::<Vec<_>>();
     let (mut responses, _) = split_results(&mut deserializer, accept_results);
     assert_eq!(responses.len(), 2, "Unexpected number of responses received");
 
@@ -296,10 +296,10 @@ fn can_receive_and_raise_event_for_metadata_from_obs() {
     let mut properties = HashMap::new();
     properties.insert("width".to_string(), Amf0Value::Number(1920_f64));
     properties.insert("height".to_string(), Amf0Value::Number(1080_f64));
-    properties.insert("videocodecid".to_string(), Amf0Value::Utf8String("avc1".to_string()));
+    properties.insert("videocodecid".to_string(), Amf0Value::Number(1_f64));
     properties.insert("videodatarate".to_string(), Amf0Value::Number(1200_f64));
     properties.insert("framerate".to_string(), Amf0Value::Number(30_f64));
-    properties.insert("audiocodecid".to_string(), Amf0Value::Utf8String("mp4a".to_string()));
+    properties.insert("audiocodecid".to_string(), Amf0Value::Number(2_f64));
     properties.insert("audiodatarate".to_string(), Amf0Value::Number(96_f64));
     properties.insert("audiosamplerate".to_string(), Amf0Value::Number(48000_f64));
     properties.insert("audiosamplesize".to_string(), Amf0Value::Number(16_f64));
@@ -328,10 +328,10 @@ fn can_receive_and_raise_event_for_metadata_from_obs() {
             assert_eq!(stream_key, test_stream_key, "Unexpected metadata stream key");
             assert_eq!(metadata.video_width, Some(1920), "Unexpected video width");
             assert_eq!(metadata.video_height, Some(1080), "Unexepcted video height");
-            assert_eq!(metadata.video_codec, Some("avc1".to_string()), "Unexepcted video codec");
+            assert_eq!(metadata.video_codec, Some(1_f64), "Unexepcted video codec");
             assert_eq!(metadata.video_frame_rate, Some(30_f32), "Unexpected framerate");
             assert_eq!(metadata.video_bitrate_kbps, Some(1200), "Unexpected video bitrate");
-            assert_eq!(metadata.audio_codec, Some("mp4a".to_string()), "Unexpected audio codec");
+            assert_eq!(metadata.audio_codec, Some(2_f64), "Unexpected audio codec");
             assert_eq!(metadata.audio_bitrate_kbps, Some(96), "Unexpected audio bitrate");
             assert_eq!(metadata.audio_sample_rate, Some(48000), "Unexpected audio sample rate");
             assert_eq!(metadata.audio_channels, Some(2), "Unexpected audio channels");
@@ -573,7 +573,7 @@ fn can_accept_play_command_with_no_optional_parameters_to_requested_stream_key()
         x => panic!("Expected play event but instead received: {:?}", x),
     };
 
-    let accept_results = session.accept_request(request_id).unwrap();
+    let accept_results = session.accept_request(request_id).unwrap().into_iter().map(ServerSessionResult::OutboundResponse).collect::<Vec<_>>();
     let (mut responses, _) = split_results(&mut deserializer, accept_results);
     assert_eq!(responses.len(), 5, "Unexpected number of messages received");
 
@@ -703,7 +703,7 @@ fn can_accept_play_command_with_all_optional_parameters_to_requested_stream_key(
         x => panic!("Expected play event but instead received: {:?}", x),
     };
 
-    let accept_results = session.accept_request(request_id).unwrap();
+    let accept_results = session.accept_request(request_id).unwrap().into_iter().map(ServerSessionResult::OutboundResponse).collect::<Vec<_>>();
     consume_results(&mut deserializer, accept_results);
 }
 
@@ -799,22 +799,22 @@ fn can_send_metadata_to_playing_stream() {
     let stream_id = create_active_stream(&mut session, &mut serializer, &mut deserializer);
     start_playing(test_stream_key.as_ref(), stream_id, &mut session, &mut serializer, &mut deserializer);
 
-    let metadata = Rc::new(StreamMetadata {
+    let metadata = ::std::rc::Rc::new(StreamMetadata {
         audio_bitrate_kbps: Some(100),
         audio_channels: Some(101),
-        audio_codec: Some("102".to_string()),
+        audio_codec: Some(102_f64),
         audio_is_stereo: Some(true),
         audio_sample_rate: Some(103),
         encoder: Some("104".to_string()),
         video_bitrate_kbps: Some(105),
-        video_codec: Some("106".to_string()),
+        video_codec: Some(106_f64),
         video_frame_rate: Some(107.0),
         video_height: Some(108),
         video_width: Some(109),
     });
 
-    let packet = session.send_metadata(stream_id, metadata).unwrap();
-    let payload = deserializer.get_next_message(&packet.bytes[..]).unwrap().unwrap();
+    let mut packet = session.send_metadata(stream_id, &metadata).unwrap();
+    let payload = deserializer.get_next_message(&mut packet.bytes[..].into()).unwrap().unwrap();
     let message = payload.to_rtmp_message().unwrap();
 
     match message {
@@ -830,10 +830,10 @@ fn can_send_metadata_to_playing_stream() {
                 Amf0Value::Object(properties) => {
                     assert_eq!(properties.get("width"), Some(&Amf0Value::Number(109.0)), "Unexpected width");
                     assert_eq!(properties.get("height"), Some(&Amf0Value::Number(108.0)), "Unexpected height");
-                    assert_eq!(properties.get("videocodecid"), Some(&Amf0Value::Utf8String("106".to_string())), "Unexpected videocodecid");
+                    assert_eq!(properties.get("videocodecid"), Some(&Amf0Value::Number(106.0)), "Unexpected videocodecid");
                     assert_eq!(properties.get("videodatarate"), Some(&Amf0Value::Number(105.0)), "Unexpected videodatarate");
                     assert_eq!(properties.get("framerate"), Some(&Amf0Value::Number(107.0)), "Unexpected framerate");
-                    assert_eq!(properties.get("audiocodecid"), Some(&Amf0Value::Utf8String("102".to_string())), "Unexpected audiocodecid");
+                    assert_eq!(properties.get("audiocodecid"), Some(&Amf0Value::Number(102.0)), "Unexpected audiocodecid");
                     assert_eq!(properties.get("audiodatarate"), Some(&Amf0Value::Number(100.0)), "Unexpected audiodatarate");
                     assert_eq!(properties.get("audiosamplerate"), Some(&Amf0Value::Number(103.0)), "Unexpected audiosamplerate");
                     assert_eq!(properties.get("audiochannels"), Some(&Amf0Value::Number(101.0)), "Unexpected audiochannels");
@@ -865,8 +865,8 @@ fn can_send_video_data_to_playing_stream() {
 
     let original_data = Bytes::from(vec![1_u8, 2_u8, 3_u8]);
     let timestamp = RtmpTimestamp::new(500);
-    let packet = session.send_video_data(stream_id, original_data.clone(), timestamp.clone(), false).unwrap();
-    let payload = deserializer.get_next_message(&packet.bytes[..]).unwrap().unwrap();
+    let mut packet = session.send_video_data(stream_id, original_data.clone(), timestamp.clone(), false).unwrap();
+    let payload = deserializer.get_next_message(&mut packet.bytes[..].into()).unwrap().unwrap();
     let message = payload.to_rtmp_message().unwrap();
 
     match message {
@@ -895,8 +895,8 @@ fn can_send_audio_data_to_playing_stream() {
 
     let original_data = Bytes::from(vec![1_u8, 2_u8, 3_u8]);
     let timestamp = RtmpTimestamp::new(500);
-    let packet = session.send_audio_data(stream_id, original_data.clone(), timestamp.clone(), false).unwrap();
-    let payload = deserializer.get_next_message(&packet.bytes[..]).unwrap().unwrap();
+    let mut packet = session.send_audio_data(stream_id, original_data.clone(), timestamp.clone(), false).unwrap();
+    let payload = deserializer.get_next_message(&mut packet.bytes[..].into()).unwrap().unwrap();
     let message = payload.to_rtmp_message().unwrap();
 
     match message {
@@ -987,8 +987,8 @@ fn can_send_ping_request() {
     consume_results(&mut deserializer, results);
     perform_connection(test_app_name.as_ref(), &mut session, &mut serializer, &mut deserializer);
 
-    let (packet, sent_timestamp) = session.send_ping_request().unwrap();
-    let payload = deserializer.get_next_message(&packet.bytes[..]).unwrap().unwrap();
+    let (mut packet, sent_timestamp) = session.send_ping_request().unwrap();
+    let payload = deserializer.get_next_message(&mut packet.bytes[..].into()).unwrap().unwrap();
     let message = payload.to_rtmp_message().unwrap();
 
     match message {
@@ -1097,8 +1097,8 @@ fn split_results(deserializer: &mut ChunkDeserializer, mut results: Vec<ServerSe
 
     for result in results.drain(..) {
         match result {
-            ServerSessionResult::OutboundResponse(packet) => {
-                let payload = deserializer.get_next_message(&packet.bytes[..]).unwrap().unwrap();
+            ServerSessionResult::OutboundResponse(mut packet) => {
+                let payload = deserializer.get_next_message(&mut packet.bytes[..].into()).unwrap().unwrap();
                 let message = payload.to_rtmp_message().unwrap();
                 match message {
                     RtmpMessage::SetChunkSize{size} => deserializer.set_max_chunk_size(size as usize).unwrap(),
@@ -1156,7 +1156,7 @@ fn perform_connection(app_name: &str, session: &mut ServerSession, serializer: &
         _ => panic!("First event was not as expected: {:?}", events[0]),
     };
 
-    let results = session.accept_request(request_id).unwrap();
+    let results = session.accept_request(request_id).unwrap().into_iter().map(ServerSessionResult::OutboundResponse).collect::<Vec<_>>();
     consume_results(deserializer, results);
 
     // Assume it was successful
@@ -1242,7 +1242,7 @@ fn start_publishing(stream_key: &str,
         _ => panic!("Unexpected first event found: {:?}", events[0]),
     };
 
-    let accept_results = session.accept_request(request_id).unwrap();
+    let accept_results = session.accept_request(request_id).unwrap().into_iter().map(ServerSessionResult::OutboundResponse).collect::<Vec<_>>();
     consume_results(deserializer, accept_results);
 }
 
@@ -1277,6 +1277,6 @@ fn start_playing(stream_key: &str,
         x => panic!("Expected play event but instead received: {:?}", x),
     };
 
-    let accept_results = session.accept_request(request_id).unwrap();
+    let accept_results = session.accept_request(request_id).unwrap().into_iter().map(ServerSessionResult::OutboundResponse).collect::<Vec<_>>();
     consume_results(deserializer, accept_results);
 }

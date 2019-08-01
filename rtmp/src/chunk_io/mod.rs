@@ -41,10 +41,10 @@ let input1 = MessagePayload {
 };
 
 let mut serializer = ChunkSerializer::new();
-let packet1 = serializer.serialize(&input1, false, false).unwrap();
+let mut packet1 = serializer.serialize(&input1, false, false).unwrap();
 
 let mut deserializer = ChunkDeserializer::new();
-let output1 = deserializer.get_next_message(&packet1.bytes).unwrap().unwrap();
+let output1 = deserializer.get_next_message(&mut packet1.bytes.into()).unwrap().unwrap();
 
 assert_eq!(output1, input1);
 # }
@@ -99,9 +99,9 @@ mod tests {
         let packet3 = serializer.serialize(&input3, false, false).unwrap();
 
         let mut deserializer = ChunkDeserializer::new();
-        let output1 = deserializer.get_next_message(&packet1.bytes).unwrap().unwrap();
-        let output2 = deserializer.get_next_message(&packet2.bytes).unwrap().unwrap();
-        let output3 = deserializer.get_next_message(&packet3.bytes).unwrap().unwrap();
+        let output1 = deserializer.get_next_message(&mut packet1.bytes.into()).unwrap().unwrap();
+        let output2 = deserializer.get_next_message(&mut packet2.bytes.into()).unwrap().unwrap();
+        let output3 = deserializer.get_next_message(&mut packet3.bytes.into()).unwrap().unwrap();
 
         assert_eq!(output1, input1, "First message was not deserialized as expected");
         assert_eq!(output2, input2, "Second message was not deserialized as expected");
@@ -137,9 +137,9 @@ mod tests {
         let packet3 = serializer.serialize(&input3, false, false).unwrap();
 
         let mut deserializer = ChunkDeserializer::new();
-        let output1 = deserializer.get_next_message(&packet1.bytes).unwrap().unwrap();
-        let output2 = deserializer.get_next_message(&packet2.bytes).unwrap().unwrap();
-        let output3 = deserializer.get_next_message(&packet3.bytes).unwrap().unwrap();
+        let output1 = deserializer.get_next_message(&mut packet1.bytes.into()).unwrap().unwrap();
+        let output2 = deserializer.get_next_message(&mut packet2.bytes.into()).unwrap().unwrap();
+        let output3 = deserializer.get_next_message(&mut packet3.bytes.into()).unwrap().unwrap();
 
         assert_eq!(output1, input1, "First message was not deserialized as expected");
         assert_eq!(output2, input2, "Second message was not deserialized as expected");

@@ -39,10 +39,10 @@ use rml_amf0::Amf0Value;
 pub struct StreamMetadata {
     pub video_width: Option<u32>,
     pub video_height: Option<u32>,
-    pub video_codec: Option<String>,
+    pub video_codec: Option<f64>,
     pub video_frame_rate: Option<f32>,
     pub video_bitrate_kbps: Option<u32>,
-    pub audio_codec: Option<String>,
+    pub audio_codec: Option<f64>,
     pub audio_bitrate_kbps: Option<u32>,
     pub audio_sample_rate: Option<u32>,
     pub audio_channels: Option<u32>,
@@ -81,7 +81,7 @@ impl StreamMetadata {
                     None => (),
                 },
 
-                "videocodecid" => match value.get_string() {
+                "videocodecid" => match value.get_number() {
                     Some(x) => self.video_codec = Some(x),
                     None => (),
                 },
@@ -96,7 +96,7 @@ impl StreamMetadata {
                     None => (),
                 },
 
-                "audiocodecid" => match value.get_string() {
+                "audiocodecid" => match value.get_number() {
                     Some(x) => self.audio_codec = Some(x),
                     None => (),
                 },
@@ -129,5 +129,45 @@ impl StreamMetadata {
                 _ => (),
             }
         }
+    }
+
+    pub fn to_amf_value(&self) -> Amf0Value {
+        let mut properties = HashMap::with_capacity(11);
+
+        self.video_width
+            .map(|x| properties.insert("width".to_string(), Amf0Value::Number(x as f64)));
+
+        self.video_height
+            .map(|x| properties.insert("height".to_string(), Amf0Value::Number(x as f64)));
+
+        self.video_codec
+            .map(|x| properties.insert("videocodecid".to_string(), Amf0Value::Number(x)));
+
+        self.video_bitrate_kbps
+            .map(|x| properties.insert("videodatarate".to_string(), Amf0Value::Number(x as f64)));
+
+        self.video_frame_rate
+            .map(|x| properties.insert("framerate".to_string(), Amf0Value::Number(x as f64)));
+
+        self.audio_codec
+            .map(|x| properties.insert("audiocodecid".to_string(), Amf0Value::Number(x)));
+
+        self.audio_bitrate_kbps
+            .map(|x| properties.insert("audiodatarate".to_string(), Amf0Value::Number(x as f64)));
+
+        self.audio_sample_rate
+            .map(|x| properties.insert("audiosamplerate".to_string(), Amf0Value::Number(x as f64)));
+
+        self.audio_channels
+            .map(|x| properties.insert("audiochannels".to_string(), Amf0Value::Number(x as f64)));
+
+        self.audio_is_stereo
+            .map(|x| properties.insert("stereo".to_string(), Amf0Value::Boolean(x)));
+
+        self.encoder
+            .as_ref()
+            .map(|x| properties.insert("encoder".to_string(), Amf0Value::Utf8String(x.clone())));
+
+        Amf0Value::Object(properties)
     }
 }

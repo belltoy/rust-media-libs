@@ -27,7 +27,7 @@ fn can_send_connect_request() {
     let (mut session, initial_results) = ClientSession::new(config.clone()).unwrap();
     consume_results(&mut deserializer, initial_results);
 
-    let results = session.request_connection(app_name.clone()).unwrap();
+    let results = session.request_connection(app_name.clone(), None).map(ClientSessionResult::OutboundResponse).unwrap();
     let (mut responses, _) = split_results(&mut deserializer, vec![results]);
 
     assert_eq!(responses.len(), 1, "Expected 1 response");
@@ -62,7 +62,7 @@ fn can_process_connect_success_response() {
     let (mut session, initial_results) = ClientSession::new(config.clone()).unwrap();
     consume_results(&mut deserializer, initial_results);
 
-    let results = session.request_connection(app_name.clone()).unwrap();
+    let results = session.request_connection(app_name.clone(), None).map(ClientSessionResult::OutboundResponse).unwrap();
     consume_results(&mut deserializer, vec![results]);
 
     let response = get_connect_success_response(&mut serializer);
@@ -85,7 +85,7 @@ fn event_raised_when_connect_request_rejected() {
     let (mut session, initial_results) = ClientSession::new(config.clone()).unwrap();
     consume_results(&mut deserializer, initial_results);
 
-    let results = session.request_connection(app_name.clone()).unwrap();
+    let results = session.request_connection(app_name.clone(), None).map(ClientSessionResult::OutboundResponse).unwrap();
     consume_results(&mut deserializer, vec![results]);
 
     let response = get_connect_error_response(&mut serializer);
@@ -111,14 +111,14 @@ fn error_thrown_when_connect_request_made_after_successful_connection() {
     let (mut session, initial_results) = ClientSession::new(config.clone()).unwrap();
     consume_results(&mut deserializer, initial_results);
 
-    let results = session.request_connection(app_name.clone()).unwrap();
+    let results = session.request_connection(app_name.clone(), None).map(ClientSessionResult::OutboundResponse).unwrap();
     consume_results(&mut deserializer, vec![results]);
 
     let response = get_connect_success_response(&mut serializer);
     let results = session.handle_input(&response.bytes[..]).unwrap();
     consume_results(&mut deserializer, results);
 
-    let error = session.request_connection(app_name.clone()).unwrap_err();
+    let error = session.request_connection(app_name.clone(), None).map(ClientSessionResult::OutboundResponse).unwrap_err();
     match error.kind {
         ClientSessionErrorKind::CantConnectWhileAlreadyConnected => (),
         x => panic!("Expected CantConnectWhileAlreadyConnected, instead found {:?}", x),
@@ -134,7 +134,7 @@ fn successful_connect_request_sends_window_ack_size() {
     let (mut session, initial_results) = ClientSession::new(config.clone()).unwrap();
     consume_results(&mut deserializer, initial_results);
 
-    let results = session.request_connection(app_name.clone()).unwrap();
+    let results = session.request_connection(app_name.clone(), None).map(ClientSessionResult::OutboundResponse).unwrap();
     consume_results(&mut deserializer, vec![results]);
 
     let response = get_connect_success_response(&mut serializer);
@@ -142,6 +142,7 @@ fn successful_connect_request_sends_window_ack_size() {
     let (mut responses, _) = split_results(&mut deserializer, results);
 
     assert_eq!(responses.len(), 1, "Unexpected number of responses received");
+    // TODO check all responses
     match responses.remove(0) {
         (payload, RtmpMessage::WindowAcknowledgement {size}) => {
             assert_eq!(payload.message_stream_id, 0, "Unexpected message stream id");
@@ -235,10 +236,10 @@ fn active_play_session_raises_events_when_stream_metadata_changes() {
     let mut properties = HashMap::new();
     properties.insert("width".to_string(), Amf0Value::Number(1920_f64));
     properties.insert("height".to_string(), Amf0Value::Number(1080_f64));
-    properties.insert("videocodecid".to_string(), Amf0Value::Utf8String("avc1".to_string()));
+    properties.insert("videocodecid".to_string(), Amf0Value::Number(1_f64));
     properties.insert("videodatarate".to_string(), Amf0Value::Number(1200_f64));
     properties.insert("framerate".to_string(), Amf0Value::Number(30_f64));
-    properties.insert("audiocodecid".to_string(), Amf0Value::Utf8String("mp4a".to_string()));
+    properties.insert("audiocodecid".to_string(), Amf0Value::Number(2_f64));
     properties.insert("audiodatarate".to_string(), Amf0Value::Number(96_f64));
     properties.insert("audiosamplerate".to_string(), Amf0Value::Number(48000_f64));
     properties.insert("audiosamplesize".to_string(), Amf0Value::Number(16_f64));
@@ -263,10 +264,10 @@ fn active_play_session_raises_events_when_stream_metadata_changes() {
         ClientSessionEvent::StreamMetadataReceived {metadata} => {
             assert_eq!(metadata.video_width, Some(1920), "Unexpected video width");
             assert_eq!(metadata.video_height, Some(1080), "Unexpected video height");
-            assert_eq!(metadata.video_codec, Some("avc1".to_string()), "Unexpected video codec");
+            assert_eq!(metadata.video_codec, Some(1_f64), "Unexpected video codec");
             assert_eq!(metadata.video_frame_rate, Some(30_f32), "Unexpected framerate");
             assert_eq!(metadata.video_bitrate_kbps, Some(1200), "Unexpected video bitrate");
-            assert_eq!(metadata.audio_codec, Some("mp4a".to_string()), "Unexpected audio codec");
+            assert_eq!(metadata.audio_codec, Some(2_f64), "Unexpected audio codec");
             assert_eq!(metadata.audio_bitrate_kbps, Some(96), "Unexpected audio bitrate");
             assert_eq!(metadata.audio_sample_rate, Some(48000), "Unexpected audio sample rate");
             assert_eq!(metadata.audio_channels, Some(2), "Unexpected audio channels");
@@ -592,8 +593,8 @@ fn can_send_ping_request() {
 
     perform_successful_connect("test".to_string(), &mut session, &mut serializer, &mut deserializer);
 
-    let (packet, sent_timestamp) = session.send_ping_request().unwrap();
-    let payload = deserializer.get_next_message(&packet.bytes[..]).unwrap().unwrap();
+    let (mut packet, sent_timestamp) = session.send_ping_request().unwrap();
+    let payload = deserializer.get_next_message(&mut packet.bytes[..].into()).unwrap().unwrap();
     let message = payload.to_rtmp_message().unwrap();
 
     match message {
@@ -697,21 +698,37 @@ fn successful_publish_request_workflow() {
 
     perform_successful_connect("test".to_string(), &mut session, &mut serializer, &mut deserializer);
 
-    let result = session.request_publishing(stream_key.clone(), PublishRequestType::Live).unwrap();
-    let (mut responses, _) = split_results(&mut deserializer, vec![result]);
+    let result = session.request_publishing(stream_key.clone(), PublishRequestType::Live).unwrap().into_iter().map(ClientSessionResult::OutboundResponse).collect::<Vec<_>>();
+    let (mut responses, _) = split_results(&mut deserializer, result);
 
-    assert_eq!(responses.len(), 1, "Unexpected number of responses");
-    let transaction_id = match responses.remove(0) {
-        (payload, RtmpMessage::Amf0Command {command_name, transaction_id, command_object, additional_arguments}) => {
-            assert_eq!(payload.message_stream_id, 0, "Unexpected stream id");
-            assert_eq!(command_name, "createStream", "Unexpected command name");
-            assert_eq!(command_object, Amf0Value::Null, "Unexpected command object");
-            assert_eq!(additional_arguments.len(), 0, "Uenxpected number of additional arguments");
-            transaction_id
-        },
-
-        x => panic!("Unexpected response seen: {:?}", x),
+    struct AssertData {
+        message_stream_id: u32,
+        command_object: Amf0Value,
+        additional_arguments: Vec<Amf0Value>,
     };
+
+    let expects: HashMap<&str, AssertData> = vec![
+        ("releaseStream", AssertData{ message_stream_id: 0, command_object: Amf0Value::Null, additional_arguments: vec![Amf0Value::Utf8String(stream_key.clone())]}),
+        ("FCPublish", AssertData{ message_stream_id: 0, command_object: Amf0Value::Null, additional_arguments: vec![Amf0Value::Utf8String(stream_key.clone())]}),
+        ("createStream", AssertData{ message_stream_id: 0, command_object: Amf0Value::Null, additional_arguments: vec![]}),
+    ].into_iter().collect();
+
+    assert_eq!(responses.len(), 3, "Unexpected number of responses");
+    let mut tid = 0_f64;
+    while responses.len() > 0 {
+        match responses.remove(0) {
+            (payload, RtmpMessage::Amf0Command {command_name, transaction_id, command_object, additional_arguments}) => {
+                let expect = expects.get(&command_name.as_str()).expect("Unexpected command name");
+                assert_eq!(payload.message_stream_id, expect.message_stream_id, "Unexpected stream id");
+                // assert_eq!(command_name, "createStream", "Unexpected command name");
+                assert_eq!(command_object, expect.command_object, "Unexpected command object");
+                assert_eq!(additional_arguments.len(), expect.additional_arguments.len(), "Uenxpected number of additional arguments");
+                tid = transaction_id;
+            }
+            x => panic!("Unexpected response seen: {:?}", x),
+        }
+    };
+    let transaction_id = tid;
 
     let (created_stream_id, create_stream_response) = get_create_stream_success_response(transaction_id, &mut serializer);
     let results = session.handle_input(&create_stream_response.bytes[..]).unwrap();
@@ -757,17 +774,17 @@ fn publisher_can_send_metadata() {
     let mut metadata = StreamMetadata::new();
     metadata.video_width = Some(100);
     metadata.video_height = Some(101);
-    metadata.video_codec = Some("vcodec".to_string());
+    metadata.video_codec = Some(1_f64);
     metadata.video_frame_rate = Some(102.0);
     metadata.video_bitrate_kbps = Some(103);
-    metadata.audio_codec = Some("acodec".to_string());
+    metadata.audio_codec = Some(2_f64);
     metadata.audio_bitrate_kbps = Some(104);
     metadata.audio_sample_rate = Some(105);
     metadata.audio_channels = Some(106);
     metadata.audio_is_stereo = Some(true);
     metadata.encoder = Some("encoder".to_string());
 
-    let result = session.publish_metadata(&metadata).unwrap();
+    let result = session.publish_metadata(&metadata).map(ClientSessionResult::OutboundResponse).unwrap();
     let (mut responses, _) = split_results(&mut deserializer, vec![result]);
 
     assert_eq!(responses.len() , 1, "Unexpected number of responses");
@@ -790,10 +807,10 @@ fn publisher_can_send_metadata() {
                 Amf0Value::Object(properties) => {
                     assert_eq!(properties.get("width"), Some(&Amf0Value::Number(100.0)), "Unexpected video width");
                     assert_eq!(properties.get("height"), Some(&Amf0Value::Number(101.0)), "Unexpected video height");
-                    assert_eq!(properties.get("videocodecid"), Some(&Amf0Value::Utf8String("vcodec".to_string())), "Unexpected video codec");
+                    assert_eq!(properties.get("videocodecid"), Some(&Amf0Value::Number(1.0)), "Unexpected video codec");
                     assert_eq!(properties.get("framerate"), Some(&Amf0Value::Number(102.0)), "Unexpected framerate");
                     assert_eq!(properties.get("videodatarate"), Some(&Amf0Value::Number(103.0)), "Unexpected video bitrate");
-                    assert_eq!(properties.get("audiocodecid"), Some(&Amf0Value::Utf8String("acodec".to_string())), "Unexpected audio codec");
+                    assert_eq!(properties.get("audiocodecid"), Some(&Amf0Value::Number(2.0)), "Unexpected audio codec");
                     assert_eq!(properties.get("audiodatarate"), Some(&Amf0Value::Number(104.0)), "Unexpected audio bitrate");
                     assert_eq!(properties.get("audiosamplerate"), Some(&Amf0Value::Number(105.0)), "Unexpected audio sample rate");
                     assert_eq!(properties.get("audiochannels"), Some(&Amf0Value::Number(106.0)), "Unexpected audio channels");
@@ -821,7 +838,7 @@ fn publisher_can_send_video_data() {
     let stream_id = perform_successful_publish_request(&mut session, &mut serializer, &mut deserializer);
 
     let data = Bytes::from(vec![1,2,3,4,5]);
-    let result = session.publish_video_data(data.clone(), RtmpTimestamp::new(1234), false).unwrap();
+    let result = session.publish_video_data(data.clone(), RtmpTimestamp::new(1234), false).map(ClientSessionResult::OutboundResponse).unwrap();
     let (mut responses, _) = split_results(&mut deserializer, vec![result]);
 
     assert_eq!(responses.len(), 1, "Unexpected number of responses");
@@ -848,7 +865,7 @@ fn publisher_can_send_audio_data() {
     let stream_id = perform_successful_publish_request(&mut session, &mut serializer, &mut deserializer);
 
     let data = Bytes::from(vec![1,2,3,4,5]);
-    let result = session.publish_audio_data(data.clone(), RtmpTimestamp::new(1234), false).unwrap();
+    let result = session.publish_audio_data(data.clone(), RtmpTimestamp::new(1234), false).map(ClientSessionResult::OutboundResponse).unwrap();
     let (mut responses, _) = split_results(&mut deserializer, vec![result]);
 
     assert_eq!(responses.len(), 1, "Unexpected number of responses");
@@ -899,8 +916,8 @@ fn split_results(deserializer: &mut ChunkDeserializer, mut results: Vec<ClientSe
 
     for result in results.drain(..) {
         match result {
-            ClientSessionResult::OutboundResponse(packet) => {
-                let payload = deserializer.get_next_message(&packet.bytes[..]).unwrap().unwrap();
+            ClientSessionResult::OutboundResponse(mut packet) => {
+                let payload = deserializer.get_next_message(&mut packet.bytes[..].into()).unwrap().unwrap();
                 let message = payload.to_rtmp_message().unwrap();
                 match message {
                     RtmpMessage::SetChunkSize{size} => deserializer.set_max_chunk_size(size as usize).unwrap(),
@@ -1026,7 +1043,7 @@ fn perform_successful_connect(app_name: String,
                               session: &mut ClientSession,
                               serializer: &mut ChunkSerializer,
                               deserializer: &mut ChunkDeserializer) {
-    let results = session.request_connection(app_name).unwrap();
+    let results = session.request_connection(app_name, None).map(ClientSessionResult::OutboundResponse).unwrap();
     consume_results(deserializer, vec![results]);
 
     let response = get_connect_success_response(serializer);
@@ -1108,21 +1125,37 @@ fn perform_successful_publish_request(session: &mut ClientSession,
                                       serializer: &mut ChunkSerializer,
                                       deserializer: &mut ChunkDeserializer) -> u32 {
     let stream_key = "abcd".to_string();
-    let result = session.request_publishing(stream_key.clone(), PublishRequestType::Live).unwrap();
-    let (mut responses, _) = split_results(deserializer, vec![result]);
+    let result = session.request_publishing(stream_key.clone(), PublishRequestType::Live).unwrap().into_iter().map(ClientSessionResult::OutboundResponse).collect::<Vec<_>>();
+    let (mut responses, _) = split_results(deserializer, result);
 
-    assert_eq!(responses.len(), 1, "Unexpected number of responses");
-    let transaction_id = match responses.remove(0) {
-        (payload, RtmpMessage::Amf0Command {command_name, transaction_id, command_object, additional_arguments}) => {
-            assert_eq!(payload.message_stream_id, 0, "Unexpected stream id");
-            assert_eq!(command_name, "createStream", "Unexpected command name");
-            assert_eq!(command_object, Amf0Value::Null, "Unexpected command object");
-            assert_eq!(additional_arguments.len(), 0, "Uenxpected number of additional arguments");
-            transaction_id
-        },
-
-        x => panic!("Unexpected response seen: {:?}", x),
+    struct AssertData {
+        message_stream_id: u32,
+        command_object: Amf0Value,
+        additional_arguments: Vec<Amf0Value>,
     };
+
+    let expects: HashMap<&str, AssertData> = vec![
+        ("releaseStream", AssertData{ message_stream_id: 0, command_object: Amf0Value::Null, additional_arguments: vec![Amf0Value::Utf8String(stream_key.clone())]}),
+        ("FCPublish", AssertData{ message_stream_id: 0, command_object: Amf0Value::Null, additional_arguments: vec![Amf0Value::Utf8String(stream_key.clone())]}),
+        ("createStream", AssertData{ message_stream_id: 0, command_object: Amf0Value::Null, additional_arguments: vec![]}),
+    ].into_iter().collect();
+
+    assert_eq!(responses.len(), 3, "Unexpected number of responses");
+    let mut tid = 0_f64;
+    while responses.len() > 0 {
+        match responses.remove(0) {
+            (payload, RtmpMessage::Amf0Command {command_name, transaction_id, command_object, additional_arguments}) => {
+                let expect = expects.get(&command_name.as_str()).expect("Unexpected command name");
+                assert_eq!(payload.message_stream_id, expect.message_stream_id, "Unexpected stream id");
+                // assert_eq!(command_name, "createStream", "Unexpected command name");
+                assert_eq!(command_object, expect.command_object, "Unexpected command object");
+                assert_eq!(additional_arguments.len(), expect.additional_arguments.len(), "Uenxpected number of additional arguments");
+                tid = transaction_id;
+            }
+            x => panic!("Unexpected response seen: {:?}", x),
+        }
+    };
+    let transaction_id = tid;
 
     let (created_stream_id, create_stream_response) = get_create_stream_success_response(transaction_id, serializer);
     let results = session.handle_input(&create_stream_response.bytes[..]).unwrap();

@@ -47,7 +47,8 @@ fn main() {
                 &buffer[..bytes_read]
             };
 
-            let payload = match deserializer.get_next_message(bytes).unwrap() {
+            // FIXME bytes
+            let payload = match deserializer.get_next_message(&mut bytes.into()).unwrap() {
                 Some(payload) => payload,
                 None => break,
             };

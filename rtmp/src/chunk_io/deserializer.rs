@@ -23,7 +23,6 @@ pub struct ChunkDeserializer {
     current_stage: ParseStage,
     current_payload: MessagePayload,
     current_payload_data: BytesMut,
-    buffer: BytesMut,
     previous_headers: HashMap<u32, ChunkHeader>,
 }
 
@@ -32,6 +31,7 @@ enum ParsedValue<T> {
     Value {val: T, next_index: u32}
 }
 
+#[derive(Debug)]
 enum ParseStage {
     Csid,
     InitialTimestamp,
@@ -59,7 +59,6 @@ impl ChunkDeserializer {
             current_header_format: ChunkHeaderFormat::Full,
             current_header: ChunkHeader::new(),
             current_stage: ParseStage::Csid,
-            buffer: BytesMut::with_capacity(4096),
             previous_headers: HashMap::new(),
             current_payload: MessagePayload::new(),
             current_payload_data: BytesMut::new(),
@@ -81,7 +80,7 @@ impl ChunkDeserializer {
     /// is deserialized and any subsequent messages are not read until the next `get_next_message()`
     /// call.
     ///
-    /// This is important because if the peer sends a `SendChunkSize` message (meaning it will
+    /// This is important because if the peer sends a `SetChunkSize` message (meaning it will
     /// change the maximum size of RTMP chunks it sends) you must process that message and call
     /// the `set_max_chunk_size()` method prior to the next `get_next_message()` call.   Otherwise
     /// if the peer sends a chunk larger than the previous max chunk size the message will not be
@@ -96,7 +95,7 @@ impl ChunkDeserializer {
     /// ```
     /// # extern crate bytes;
     /// # extern crate rml_rtmp;
-    /// # use bytes::Bytes;
+    /// # use bytes::{Bytes, BytesMut};
     /// # use rml_rtmp::time::RtmpTimestamp;
     /// # use rml_rtmp::chunk_io::{ChunkSerializer, ChunkDeserializer};
     /// # use rml_rtmp::messages::MessagePayload;
@@ -133,10 +132,11 @@ impl ChunkDeserializer {
     /// all_bytes.append(&mut packet3.bytes);
     ///
     /// let mut deserializer = ChunkDeserializer::new();
-    /// let message1 = deserializer.get_next_message(&all_bytes[..]).unwrap();
-    /// let message2 = deserializer.get_next_message(&[]).unwrap();
-    /// let message3 = deserializer.get_next_message(&[]).unwrap();
-    /// let message4 = deserializer.get_next_message(&[]).unwrap();
+    /// let mut buf: BytesMut = all_bytes.into();
+    /// let message1 = deserializer.get_next_message(&mut buf).unwrap();
+    /// let message2 = deserializer.get_next_message(&mut buf).unwrap();
+    /// let message3 = deserializer.get_next_message(&mut buf).unwrap();
+    /// let message4 = deserializer.get_next_message(&mut buf).unwrap();
     ///
     /// assert_eq!(message1, Some(input1));
     /// assert_eq!(message2, Some(input2));
@@ -144,19 +144,17 @@ impl ChunkDeserializer {
     /// assert_eq!(message4, None);
     /// # }
     /// ```
-    pub fn get_next_message(&mut self, bytes: &[u8]) -> Result<Option<MessagePayload>, ChunkDeserializationError> {
-        self.buffer.extend_from_slice(bytes);
-
+    pub fn get_next_message(&mut self, buf: &mut BytesMut) -> Result<Option<MessagePayload>, ChunkDeserializationError> {
         loop {
             let mut complete_message = None;
             let result = match self.current_stage {
-                ParseStage::Csid => self.form_header()?,
-                ParseStage::InitialTimestamp => self.get_initial_timestamp()?,
-                ParseStage::MessageLength => self.get_message_length()?,
-                ParseStage::MessageTypeId => self.get_message_type_id()?,
-                ParseStage::MessageStreamId => self.get_message_stream_id()?,
-                ParseStage::ExtendedTimestamp => self.get_extended_timestamp()?,
-                ParseStage::MessagePayload => self.get_message_data(&mut complete_message)?,
+                ParseStage::Csid => self.form_header(buf)?,
+                ParseStage::InitialTimestamp => self.get_initial_timestamp(buf)?,
+                ParseStage::MessageLength => self.get_message_length(buf)?,
+                ParseStage::MessageTypeId => self.get_message_type_id(buf)?,
+                ParseStage::MessageStreamId => self.get_message_stream_id(buf)?,
+                ParseStage::ExtendedTimestamp => self.get_extended_timestamp(buf)?,
+                ParseStage::MessagePayload => self.get_message_data(&mut complete_message, buf)?,
             };
 
             if result == ParseStageResult::NotEnoughBytes || complete_message.is_some() {
@@ -191,13 +189,13 @@ impl ChunkDeserializer {
         self.max_chunk_size
     }
 
-    fn form_header(&mut self) -> Result<ParseStageResult, ChunkDeserializationError> {
-        if self.buffer.len() < 1 {
+    fn form_header(&mut self, buf: &mut BytesMut) -> Result<ParseStageResult, ChunkDeserializationError> {
+        if buf.len() < 1 {
             return Ok(ParseStageResult::NotEnoughBytes);
         }
 
-        self.current_header_format = get_format(&self.buffer[0]);
-        let (csid, next_index) = match get_csid(&self.buffer[..]) {
+        self.current_header_format = get_format(&buf[0]);
+        let (csid, next_index) = match get_csid(&buf[..]) {
             ParsedValue::NotEnoughBytes => return Ok(ParseStageResult::NotEnoughBytes),
             ParsedValue::Value{val, next_index} => (val, next_index)
         };
@@ -215,12 +213,12 @@ impl ChunkDeserializer {
             }
         };
 
-        self.buffer.split_to(next_index as usize);
+        buf.split_to(next_index as usize);
         self.current_stage = ParseStage::InitialTimestamp;
         Ok(ParseStageResult::Success)
     }
 
-    fn get_initial_timestamp(&mut self) -> Result<ParseStageResult, ChunkDeserializationError> {
+    fn get_initial_timestamp(&mut self, buf: &mut BytesMut) -> Result<ParseStageResult, ChunkDeserializationError> {
         if self.current_header_format == ChunkHeaderFormat::Empty {
             // Some encoders send an empty header after a type 1 header due to a message split
             // across multiple chunks.  We need to be careful *NOT* to apply the delta to each
@@ -237,13 +235,13 @@ impl ChunkDeserializer {
             return Ok(ParseStageResult::Success);
         }
 
-        if self.buffer.len() < 3 {
+        if buf.len() < 3 {
             return Ok(ParseStageResult::NotEnoughBytes);
         }
 
         let timestamp;
         {
-            let bytes = self.buffer.split_to(3);
+            let bytes = buf.split_to(3);
             let mut cursor = Cursor::new(bytes);
             timestamp = cursor.read_u24::<BigEndian>()?;
         }
@@ -260,19 +258,19 @@ impl ChunkDeserializer {
         Ok(ParseStageResult::Success)
     }
 
-    fn get_message_length(&mut self) -> Result<ParseStageResult, ChunkDeserializationError> {
+    fn get_message_length(&mut self, buf: &mut BytesMut) -> Result<ParseStageResult, ChunkDeserializationError> {
         if self.current_header_format == ChunkHeaderFormat::TimeDeltaOnly || self.current_header_format == ChunkHeaderFormat::Empty {
             self.current_stage = ParseStage::MessageTypeId;
             return Ok(ParseStageResult::Success);
         }
 
-        if self.buffer.len() < 3 {
+        if buf.len() < 3 {
             return Ok(ParseStageResult::NotEnoughBytes);
         }
 
         let length;
         {
-            let bytes = self.buffer.split_to(3);
+            let bytes = buf.split_to(3);
             let mut cursor = Cursor::new(bytes);
             length = cursor.read_u24::<BigEndian>()?;
         }
@@ -282,35 +280,35 @@ impl ChunkDeserializer {
         Ok(ParseStageResult::Success)
     }
 
-    fn get_message_type_id(&mut self) -> Result<ParseStageResult, ChunkDeserializationError> {
+    fn get_message_type_id(&mut self, buf: &mut BytesMut) -> Result<ParseStageResult, ChunkDeserializationError> {
         if self.current_header_format == ChunkHeaderFormat::TimeDeltaOnly || self.current_header_format == ChunkHeaderFormat::Empty {
             self.current_stage = ParseStage::MessageStreamId;
             return Ok(ParseStageResult::Success);
         }
 
-        if self.buffer.len() < 1 {
+        if buf.len() < 1 {
             return Ok(ParseStageResult::NotEnoughBytes);
         }
 
-        self.current_header.message_type_id = self.buffer[0];
-        self.buffer.split_to(1);
+        self.current_header.message_type_id = buf[0];
+        buf.split_to(1);
         self.current_stage = ParseStage::MessageStreamId;
         Ok(ParseStageResult::Success)
     }
 
-    fn get_message_stream_id(&mut self) -> Result<ParseStageResult, ChunkDeserializationError> {
+    fn get_message_stream_id(&mut self, buf: &mut BytesMut) -> Result<ParseStageResult, ChunkDeserializationError> {
         if self.current_header_format != ChunkHeaderFormat::Full {
             self.current_stage = ParseStage::ExtendedTimestamp;
             return Ok(ParseStageResult::Success);
         }
 
-        if self.buffer.len() < 4 {
+        if buf.len() < 4 {
             return Ok(ParseStageResult::NotEnoughBytes);
         }
 
         let stream_id;
         {
-            let bytes = self.buffer.split_to(4);
+            let bytes = buf.split_to(4);
             let mut cursor = Cursor::new(bytes);
             stream_id = cursor.read_u32::<LittleEndian>()?;
         }
@@ -320,7 +318,7 @@ impl ChunkDeserializer {
         Ok(ParseStageResult::Success)
     }
 
-    fn get_extended_timestamp(&mut self) -> Result<ParseStageResult, ChunkDeserializationError> {
+    fn get_extended_timestamp(&mut self, buf: &mut BytesMut) -> Result<ParseStageResult, ChunkDeserializationError> {
         if self.current_header_format == ChunkHeaderFormat::Empty {
             // Since this header does not have a timestamp, it uses the previously used delta.
             // However, since we don't need to deal with reading any more bytes we have already
@@ -340,13 +338,13 @@ impl ChunkDeserializer {
             return Ok(ParseStageResult::Success);
         }
 
-        if self.current_header_format != ChunkHeaderFormat::Empty && self.buffer.len() < 4 {
+        if self.current_header_format != ChunkHeaderFormat::Empty && buf.len() < 4 {
             return Ok(ParseStageResult::NotEnoughBytes);
         }
 
         let timestamp;
         {
-            let bytes = self.buffer.split_to(4);
+            let bytes = buf.split_to(4);
             let mut cursor = Cursor::new(bytes);
             timestamp = cursor.read_u32::<BigEndian>()?;
         }
@@ -364,7 +362,7 @@ impl ChunkDeserializer {
         Ok(ParseStageResult::Success)
     }
 
-    fn get_message_data(&mut self, message_to_return: &mut Option<MessagePayload>) -> Result<ParseStageResult, ChunkDeserializationError> {
+    fn get_message_data(&mut self, message_to_return: &mut Option<MessagePayload>, buf: &mut BytesMut) -> Result<ParseStageResult, ChunkDeserializationError> {
         let mut length = self.current_header.message_length as usize;
         let current_payload_length = self.current_payload_data.len();
         let remaining_bytes = length - current_payload_length;
@@ -372,7 +370,7 @@ impl ChunkDeserializer {
             length = min(remaining_bytes, self.max_chunk_size as usize);
         }
 
-        if self.buffer.len() < length {
+        if buf.len() < length {
             return Ok(ParseStageResult::NotEnoughBytes);
         }
 
@@ -387,7 +385,7 @@ impl ChunkDeserializer {
             self.current_payload_data.reserve(capacity_needed);
         }
 
-        let bytes = self.buffer.split_to(length as usize);
+        let bytes = buf.split_to(length as usize);
         self.current_payload_data.extend_from_slice(&bytes[..]);
 
         // Check if this completes the message
@@ -466,9 +464,9 @@ mod tests {
         let type_id = 3;
         let payload = [1_u8, 2_u8, 3_u8];
 
-        let bytes = form_type_0_chunk(csid, timestamp, message_stream_id, type_id, &payload, INITIAL_MAX_CHUNK_SIZE);
+        let mut bytes = form_type_0_chunk(csid, timestamp, message_stream_id, type_id, &payload, INITIAL_MAX_CHUNK_SIZE);
         let mut deserializer = ChunkDeserializer::new();
-        let result = deserializer.get_next_message(&bytes).unwrap().unwrap();
+        let result = deserializer.get_next_message(&mut bytes).unwrap().unwrap();
 
         assert_eq!(result.type_id, 3, "Incorrect type id");
         assert_eq!(result.timestamp, RtmpTimestamp::new(timestamp), "Incorrect timestamp");
@@ -483,9 +481,9 @@ mod tests {
         let type_id = 3;
         let payload = [1_u8, 2_u8, 3_u8];
 
-        let bytes = form_type_0_chunk(csid, timestamp, message_stream_id, type_id, &payload, INITIAL_MAX_CHUNK_SIZE);
+        let mut bytes = form_type_0_chunk(csid, timestamp, message_stream_id, type_id, &payload, INITIAL_MAX_CHUNK_SIZE);
         let mut deserializer = ChunkDeserializer::new();
-        let result = deserializer.get_next_message(&bytes).unwrap().unwrap();
+        let result = deserializer.get_next_message(&mut bytes).unwrap().unwrap();
 
         assert_eq!(result.type_id, 3, "Incorrect type id");
         assert_eq!(result.timestamp, RtmpTimestamp::new(timestamp), "Incorrect timestamp");
@@ -500,9 +498,9 @@ mod tests {
         let type_id = 3;
         let payload = [1_u8, 2_u8, 3_u8];
 
-        let bytes = form_type_0_chunk(csid, timestamp, message_stream_id, type_id, &payload, INITIAL_MAX_CHUNK_SIZE);
+        let mut bytes = form_type_0_chunk(csid, timestamp, message_stream_id, type_id, &payload, INITIAL_MAX_CHUNK_SIZE);
         let mut deserializer = ChunkDeserializer::new();
-        let result = deserializer.get_next_message(&bytes).unwrap().unwrap();
+        let result = deserializer.get_next_message(&mut bytes).unwrap().unwrap();
 
         assert_eq!(result.type_id, 3, "Incorrect type id");
         assert_eq!(result.timestamp, RtmpTimestamp::new(timestamp), "Incorrect timestamp");
@@ -517,9 +515,9 @@ mod tests {
         let type_id = 3;
         let payload = [1_u8, 2_u8, 3_u8];
 
-        let bytes = form_type_0_chunk(csid, timestamp, message_stream_id, type_id, &payload, INITIAL_MAX_CHUNK_SIZE);
+        let mut bytes = form_type_0_chunk(csid, timestamp, message_stream_id, type_id, &payload, INITIAL_MAX_CHUNK_SIZE);
         let mut deserializer = ChunkDeserializer::new();
-        let result = deserializer.get_next_message(&bytes).unwrap().unwrap();
+        let result = deserializer.get_next_message(&mut bytes).unwrap().unwrap();
 
         assert_eq!(result.type_id, 3, "Incorrect type id");
         assert_eq!(result.timestamp, RtmpTimestamp::new(timestamp), "Incorrect timestamp");
@@ -534,9 +532,9 @@ mod tests {
         let type_id = 3;
         let payload = [1_u8, 2_u8, 3_u8];
 
-        let bytes = form_type_0_chunk(csid, timestamp, message_stream_id, type_id, &payload, INITIAL_MAX_CHUNK_SIZE);
+        let mut bytes = form_type_0_chunk(csid, timestamp, message_stream_id, type_id, &payload, INITIAL_MAX_CHUNK_SIZE);
         let mut deserializer = ChunkDeserializer::new();
-        let result = deserializer.get_next_message(&bytes).unwrap().unwrap();
+        let result = deserializer.get_next_message(&mut bytes).unwrap().unwrap();
 
         assert_eq!(result.type_id, 3, "Incorrect type id");
         assert_eq!(result.timestamp, RtmpTimestamp::new(timestamp), "Incorrect timestamp");
@@ -551,9 +549,9 @@ mod tests {
         let type_id = 3;
         let payload = [1_u8, 2_u8, 3_u8];
 
-        let bytes = form_type_0_chunk(csid, timestamp, message_stream_id, type_id, &payload, INITIAL_MAX_CHUNK_SIZE);
+        let mut bytes = form_type_0_chunk(csid, timestamp, message_stream_id, type_id, &payload, INITIAL_MAX_CHUNK_SIZE);
         let mut deserializer = ChunkDeserializer::new();
-        let result = deserializer.get_next_message(&bytes).unwrap().unwrap();
+        let result = deserializer.get_next_message(&mut bytes).unwrap().unwrap();
 
         assert_eq!(result.type_id, 3, "Incorrect type id");
         assert_eq!(result.timestamp, RtmpTimestamp::new(timestamp), "Incorrect timestamp");
@@ -570,11 +568,11 @@ mod tests {
         let type_id2 = 4;
         let payload = [1_u8, 2_u8, 3_u8];
 
-        let chunk_0_bytes = form_type_0_chunk(csid, timestamp, message_stream_id, type_id1, &payload, INITIAL_MAX_CHUNK_SIZE);
-        let chunk_1_bytes = form_type_1_chunk(csid, delta, type_id2, &payload);
+        let mut chunk_0_bytes = form_type_0_chunk(csid, timestamp, message_stream_id, type_id1, &payload, INITIAL_MAX_CHUNK_SIZE);
+        let mut chunk_1_bytes = form_type_1_chunk(csid, delta, type_id2, &payload);
         let mut deserializer = ChunkDeserializer::new();
-        let _ = deserializer.get_next_message(&chunk_0_bytes).unwrap().unwrap();
-        let result = deserializer.get_next_message(&chunk_1_bytes).unwrap().unwrap();
+        let _ = deserializer.get_next_message(&mut chunk_0_bytes).unwrap().unwrap();
+        let result = deserializer.get_next_message(&mut chunk_1_bytes).unwrap().unwrap();
 
         assert_eq!(result.type_id, type_id2, "Incorrect type id");
         assert_eq!(result.timestamp, RtmpTimestamp::new(timestamp + delta), "Incorrect timestamp");
@@ -592,13 +590,13 @@ mod tests {
         let type_id2 = 4;
         let payload = [1_u8, 2_u8, 3_u8];
 
-        let chunk_0_bytes = form_type_0_chunk(csid, timestamp, message_stream_id, type_id1, &payload, INITIAL_MAX_CHUNK_SIZE);
-        let chunk_1_bytes = form_type_1_chunk(csid, delta1, type_id2, &payload);
-        let chunk_2_bytes = form_type_2_chunk(csid, delta2, &payload);
+        let mut chunk_0_bytes = form_type_0_chunk(csid, timestamp, message_stream_id, type_id1, &payload, INITIAL_MAX_CHUNK_SIZE);
+        let mut chunk_1_bytes = form_type_1_chunk(csid, delta1, type_id2, &payload);
+        let mut chunk_2_bytes = form_type_2_chunk(csid, delta2, &payload);
         let mut deserializer = ChunkDeserializer::new();
-        let _ = deserializer.get_next_message(&chunk_0_bytes).unwrap().unwrap();
-        let _ = deserializer.get_next_message(&chunk_1_bytes).unwrap().unwrap();
-        let result = deserializer.get_next_message(&chunk_2_bytes).unwrap().unwrap();
+        let _ = deserializer.get_next_message(&mut chunk_0_bytes).unwrap().unwrap();
+        let _ = deserializer.get_next_message(&mut chunk_1_bytes).unwrap().unwrap();
+        let result = deserializer.get_next_message(&mut chunk_2_bytes).unwrap().unwrap();
 
         assert_eq!(result.type_id, type_id2, "Incorrect type id");
         assert_eq!(result.timestamp, RtmpTimestamp::new(timestamp + delta1 + delta2), "Incorrect timestamp");
@@ -617,13 +615,13 @@ mod tests {
         let type_id2 = 4;
         let payload = [1_u8, 2_u8, 3_u8];
 
-        let chunk_0_bytes = form_type_0_chunk(csid, timestamp, message_stream_id, type_id1, &payload, INITIAL_MAX_CHUNK_SIZE);
-        let chunk_1_bytes = form_type_1_chunk(csid, delta1, type_id2, &payload);
-        let chunk_2_bytes = form_type_2_chunk(csid, delta2, &payload);
+        let mut chunk_0_bytes = form_type_0_chunk(csid, timestamp, message_stream_id, type_id1, &payload, INITIAL_MAX_CHUNK_SIZE);
+        let mut chunk_1_bytes = form_type_1_chunk(csid, delta1, type_id2, &payload);
+        let mut chunk_2_bytes = form_type_2_chunk(csid, delta2, &payload);
         let mut deserializer = ChunkDeserializer::new();
-        let _ = deserializer.get_next_message(&chunk_0_bytes).unwrap().unwrap();
-        let _ = deserializer.get_next_message(&chunk_1_bytes).unwrap().unwrap();
-        let result = deserializer.get_next_message(&chunk_2_bytes).unwrap().unwrap();
+        let _ = deserializer.get_next_message(&mut chunk_0_bytes).unwrap().unwrap();
+        let _ = deserializer.get_next_message(&mut chunk_1_bytes).unwrap().unwrap();
+        let result = deserializer.get_next_message(&mut chunk_2_bytes).unwrap().unwrap();
 
         assert_eq!(result.type_id, type_id2, "Incorrect type id");
         assert_eq!(result.timestamp, RtmpTimestamp::new(timestamp + delta1 + delta2), "Incorrect timestamp");
@@ -641,15 +639,15 @@ mod tests {
         let type_id2 = 4;
         let payload = [1_u8, 2_u8, 3_u8];
 
-        let chunk_0_bytes = form_type_0_chunk(csid, timestamp, message_stream_id, type_id1, &payload, INITIAL_MAX_CHUNK_SIZE);
-        let chunk_1_bytes = form_type_1_chunk(csid, delta1, type_id2, &payload);
-        let chunk_2_bytes = form_type_2_chunk(csid, delta2, &payload);
-        let chunk_3_bytes = form_type_3_chunk(csid, &payload, INITIAL_MAX_CHUNK_SIZE);
+        let mut chunk_0_bytes = form_type_0_chunk(csid, timestamp, message_stream_id, type_id1, &payload, INITIAL_MAX_CHUNK_SIZE);
+        let mut chunk_1_bytes = form_type_1_chunk(csid, delta1, type_id2, &payload);
+        let mut chunk_2_bytes = form_type_2_chunk(csid, delta2, &payload);
+        let mut chunk_3_bytes = form_type_3_chunk(csid, &payload, INITIAL_MAX_CHUNK_SIZE);
         let mut deserializer = ChunkDeserializer::new();
-        let _ = deserializer.get_next_message(&chunk_0_bytes).unwrap().unwrap();
-        let _ = deserializer.get_next_message(&chunk_1_bytes).unwrap().unwrap();
-        let _ = deserializer.get_next_message(&chunk_2_bytes).unwrap().unwrap();
-        let result = deserializer.get_next_message(&chunk_3_bytes).unwrap().unwrap();
+        let _ = deserializer.get_next_message(&mut chunk_0_bytes).unwrap().unwrap();
+        let _ = deserializer.get_next_message(&mut chunk_1_bytes).unwrap().unwrap();
+        let _ = deserializer.get_next_message(&mut chunk_2_bytes).unwrap().unwrap();
+        let result = deserializer.get_next_message(&mut chunk_3_bytes).unwrap().unwrap();
 
         assert_eq!(result.type_id, type_id2, "Incorrect type id");
         assert_eq!(result.timestamp, RtmpTimestamp::new(timestamp + delta1 + delta2 + delta2), "Incorrect timestamp");
@@ -667,15 +665,15 @@ mod tests {
         let type_id2 = 4;
         let payload = [1_u8, 2_u8, 3_u8];
 
-        let chunk_0_bytes = form_type_0_chunk(csid, timestamp, message_stream_id, type_id1, &payload, INITIAL_MAX_CHUNK_SIZE);
-        let chunk_1_bytes = form_type_1_chunk(csid, delta1, type_id2, &payload);
-        let chunk_2_bytes = form_type_2_chunk(csid, delta2, &payload);
-        let chunk_3_bytes = form_type_3_chunk(csid, &payload, INITIAL_MAX_CHUNK_SIZE);
+        let mut chunk_0_bytes = form_type_0_chunk(csid, timestamp, message_stream_id, type_id1, &payload, INITIAL_MAX_CHUNK_SIZE);
+        let mut chunk_1_bytes = form_type_1_chunk(csid, delta1, type_id2, &payload);
+        let mut chunk_2_bytes = form_type_2_chunk(csid, delta2, &payload);
+        let mut chunk_3_bytes = form_type_3_chunk(csid, &payload, INITIAL_MAX_CHUNK_SIZE);
         let mut deserializer = ChunkDeserializer::new();
-        let _ = deserializer.get_next_message(&chunk_0_bytes).unwrap().unwrap();
-        let _ = deserializer.get_next_message(&chunk_1_bytes).unwrap().unwrap();
-        let _ = deserializer.get_next_message(&chunk_2_bytes).unwrap().unwrap();
-        let result = deserializer.get_next_message(&chunk_3_bytes).unwrap().unwrap();
+        let _ = deserializer.get_next_message(&mut chunk_0_bytes).unwrap().unwrap();
+        let _ = deserializer.get_next_message(&mut chunk_1_bytes).unwrap().unwrap();
+        let _ = deserializer.get_next_message(&mut chunk_2_bytes).unwrap().unwrap();
+        let result = deserializer.get_next_message(&mut chunk_3_bytes).unwrap().unwrap();
 
         assert_eq!(result.type_id, type_id2, "Incorrect type id");
         assert_eq!(result.timestamp, RtmpTimestamp::new(timestamp + delta1 + delta2 + delta2), "Incorrect timestamp");
@@ -690,15 +688,16 @@ mod tests {
         let type_id = 3;
         let payload = [1_u8, 2_u8, 3_u8];
 
-        let all_bytes = form_type_0_chunk(csid, timestamp, message_stream_id, type_id, &payload, INITIAL_MAX_CHUNK_SIZE);
-        let (first, second) = all_bytes.split_at(all_bytes.len() / 2);
+        let mut all_bytes = form_type_0_chunk(csid, timestamp, message_stream_id, type_id, &payload, INITIAL_MAX_CHUNK_SIZE);
+        let len = all_bytes.len();
+        let mut first = all_bytes.split_to(len / 2);
         let mut deserializer = ChunkDeserializer::new();
-        match deserializer.get_next_message(first).unwrap() {
+        match deserializer.get_next_message(&mut first).unwrap() {
             Some(x) => panic!("Expected None but received {:?}", x),
             None => (),
         };
 
-        let result = deserializer.get_next_message(second).unwrap().unwrap();
+        let result = deserializer.get_next_message(&mut all_bytes).unwrap().unwrap();
 
         assert_eq!(result.type_id, 3, "Incorrect type id");
         assert_eq!(result.timestamp, RtmpTimestamp::new(timestamp), "Incorrect timestamp");
@@ -714,10 +713,10 @@ mod tests {
         let payload = [100_u8; 500];
         let max_chunk_size = 100;
 
-        let bytes = form_type_0_chunk(csid, timestamp, message_stream_id, type_id, &payload, max_chunk_size);
+        let mut bytes = form_type_0_chunk(csid, timestamp, message_stream_id, type_id, &payload, max_chunk_size);
         let mut deserializer = ChunkDeserializer::new();
         deserializer.set_max_chunk_size(max_chunk_size).unwrap();
-        let result = deserializer.get_next_message(&bytes).unwrap().unwrap();
+        let result = deserializer.get_next_message(&mut bytes).unwrap().unwrap();
 
         assert_eq!(result.type_id, 3, "Incorrect type id");
         assert_eq!(result.timestamp, RtmpTimestamp::new(timestamp), "Incorrect timestamp");
@@ -743,24 +742,24 @@ mod tests {
         // parts of that chunk with a type 3 header (even though the delta should not be applied).
         // this test verifies we can handle that.
 
-        let chunk1 = [0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x09, 0x01, 0x00, 0x00, 0x00, 0x01];
-        let chunk2 = [0x44, 0x00, 0x00, 0x21, 0x00, 0x00, 0x05, 0x09, 0x01, 0x02, 0x03, 0x04, 0xc4, 0x05];
+        let chunk1: &[u8] = &[0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x09, 0x01, 0x00, 0x00, 0x00, 0x01];
+        let chunk2: &[u8] = &[0x44, 0x00, 0x00, 0x21, 0x00, 0x00, 0x05, 0x09, 0x01, 0x02, 0x03, 0x04, 0xc4, 0x05];
 
         let mut deserializer = ChunkDeserializer::new();
         deserializer.set_max_chunk_size(4).unwrap();
 
-        let payload1 = deserializer.get_next_message(&chunk1).unwrap().unwrap();
+        let payload1 = deserializer.get_next_message(&mut chunk1.into()).unwrap().unwrap();
         assert_eq!(payload1.type_id, 0x09, "Incorrect payload 1 type");
         assert_eq!(payload1.timestamp, RtmpTimestamp::new(0), "Incorrect payload 1 timestamp");
         assert_eq!(&payload1.data[..], &[0x01], "Incorrect payload 1 data");
 
-        let payload2 = deserializer.get_next_message(&chunk2).unwrap().unwrap();
+        let payload2 = deserializer.get_next_message(&mut chunk2.into()).unwrap().unwrap();
         assert_eq!(payload2.type_id, 0x09, "Incorrect payload 2 type");
         assert_eq!(payload2.timestamp, RtmpTimestamp::new(33), "Incorrect payload 2 timestamp");
         assert_eq!(&payload2.data[..], &[0x01, 0x02, 0x03, 0x04, 0x05], "Incorrect payload 2 data");
     }
 
-    fn form_type_0_chunk(csid: u32, timestamp: u32, message_stream_id: u32, type_id: u8, payload: &[u8], max_chunk_length: usize) -> Vec<u8> {
+    fn form_type_0_chunk(csid: u32, timestamp: u32, message_stream_id: u32, type_id: u8, payload: &[u8], max_chunk_length: usize) -> BytesMut {
         let mut cursor = Cursor::new(Vec::new());
         if csid < 64 {
             cursor.write_u8(csid as u8).unwrap();
@@ -794,10 +793,10 @@ mod tests {
             cursor.write(payload).unwrap();
         }
 
-        cursor.into_inner()
+        cursor.into_inner().into()
     }
 
-    fn form_type_1_chunk(csid: u32, delta: u32, type_id: u8, payload: &[u8]) -> Vec<u8> {
+    fn form_type_1_chunk(csid: u32, delta: u32, type_id: u8, payload: &[u8]) -> BytesMut {
         let mut cursor = Cursor::new(Vec::new());
         if csid < 64 {
             cursor.write_u8((csid as u8) | 0b01000000).unwrap();
@@ -820,10 +819,10 @@ mod tests {
 
         cursor.write(payload).unwrap();
 
-        cursor.into_inner()
+        cursor.into_inner().into()
     }
 
-    fn form_type_2_chunk(csid: u32, delta: u32,  payload: &[u8]) -> Vec<u8> {
+    fn form_type_2_chunk(csid: u32, delta: u32,  payload: &[u8]) -> BytesMut {
         let mut cursor = Cursor::new(Vec::new());
         if csid < 64 {
             cursor.write_u8((csid as u8) | 0b10000000).unwrap();
@@ -844,10 +843,10 @@ mod tests {
 
         cursor.write(payload).unwrap();
 
-        cursor.into_inner()
+        cursor.into_inner().into()
     }
 
-    fn form_type_3_chunk(csid: u32, payload: &[u8], max_chunk_length: usize) -> Vec<u8> {
+    fn form_type_3_chunk(csid: u32, payload: &[u8], max_chunk_length: usize) -> BytesMut {
         let mut cursor = Cursor::new(Vec::new());
         if csid < 64 {
             cursor.write_u8((csid as u8) | 0b11000000).unwrap();
@@ -871,6 +870,6 @@ mod tests {
             cursor.write(payload).unwrap();
         }
 
-        cursor.into_inner()
+        cursor.into_inner().into()
     }
 }

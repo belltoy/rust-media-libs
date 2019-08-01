@@ -25,7 +25,7 @@ use rml_amf0::Amf0Value;
 use time::RtmpTimestamp;
 use sessions::StreamMetadata;
 use chunk_io::{ChunkSerializer, ChunkDeserializer, Packet};
-use messages::{RtmpMessage, UserControlEventType};
+use messages::{RtmpMessage, UserControlEventType, MessagePayload};
 
 type ClientResult = Result<Vec<ClientSessionResult>, ClientSessionError>;
 
@@ -94,58 +94,28 @@ impl ClientSession {
 
     /// Takes in any number of bytes from the peer and processes them.  Any resulting responses or
     /// events are returned.
+    ///
+    /// NOTE: Used in mio based server
     pub fn handle_input(&mut self, bytes: &[u8]) -> ClientResult {
         let mut results = Vec::new();
-        self.bytes_received += bytes.len() as u64;
-
-        if let Some(peer_ack_size) = self.peer_window_ack_size {
-            self.bytes_received_since_last_ack += bytes.len() as u32;
-            if self.bytes_received_since_last_ack >= peer_ack_size {
-                let ack_message = RtmpMessage::Acknowledgement {sequence_number: self.bytes_received_since_last_ack};
-                let ack_payload = ack_message.into_message_payload(self.get_epoch(), 0)?;
-                let ack_packet = self.serializer.serialize(&ack_payload, false, false)?;
-
-                self.bytes_received_since_last_ack = 0;
-                results.push(ClientSessionResult::OutboundResponse(ack_packet));
-            }
+        if let Some(packet) = self.received_bytes(bytes.len())? {
+            results.push(ClientSessionResult::OutboundResponse(packet));
         }
 
-        let mut bytes_to_process = bytes;
+        let mut bytes_to_process = bytes.into();
         loop {
-            match self.deserializer.get_next_message(bytes_to_process)? {
+            match self.deserializer.get_next_message(&mut bytes_to_process)? {
                 None => break, // no more messages
                 Some(payload) => {
-                    let message = payload.to_rtmp_message()?;
-                    let mut message_results = match message {
-                        RtmpMessage::Acknowledgement {sequence_number}
-                            => self.handle_acknowledgement(sequence_number)?,
-
-                        RtmpMessage::Amf0Command {command_name, transaction_id, command_object, additional_arguments}
-                            => self.handle_amf0_command(command_name, transaction_id, command_object, additional_arguments)?,
-
-                        RtmpMessage::Amf0Data {values}
-                            => self.handle_amf0_data(values, payload.message_stream_id)?,
-
-                        RtmpMessage::AudioData {data}
-                            => self.handle_audio_data(payload.message_stream_id, data, payload.timestamp)?,
-
-                        RtmpMessage::VideoData {data}
-                            => self.handle_video_data(payload.message_stream_id, data, payload.timestamp)?,
-
-                        RtmpMessage::UserControl {event_type, timestamp, stream_id, buffer_length}
-                            => self.handle_user_control(event_type, timestamp, stream_id, buffer_length)?,
-
-                        RtmpMessage::WindowAcknowledgement {size}
-                            => self.handle_window_ack_size(size)?,
-
-                        RtmpMessage::SetChunkSize{size}
-                            => self.handle_set_chunk_size(size)?,
-
-                        _ => vec![ClientSessionResult::UnhandleableMessageReceived(payload)],
-                    };
-
-                    results.append(&mut message_results);
-                    bytes_to_process = &[];
+                    let (packets, event, other) = self.handle_message(payload)?;
+                    let mut packets = packets.into_iter().map(ClientSessionResult::OutboundResponse).collect::<Vec<_>>();
+                    results.append(&mut packets);
+                    if let Some(event) = event {
+                        results.push(ClientSessionResult::RaisedEvent(event));
+                    }
+                    if let Some(payload) = other {
+                        results.push(ClientSessionResult::UnhandleableMessageReceived(payload));
+                    }
                 }
             }
         }
@@ -153,9 +123,87 @@ impl ClientSession {
         Ok(results)
     }
 
+    /// Handle a received MessagePayload, with its raw bytes length.
+    /// Returns responses, raised events, or maybe some unhandleable message payload in a 3-length
+    /// tuple:
+    /// `(responses, event, unhandleable_message_payload): (Vec<Packet>, Option<ClientSessionEvent>, Option<MessagePayload>)`
+    ///
+    /// NOTE: Used in tokio based server
+    pub fn handle_input_message(&mut self, payload: MessagePayload, bytes: usize)
+        -> Result<(Vec<Packet>, Option<ClientSessionEvent>, Option<MessagePayload>), ClientSessionError>
+    {
+        let mut outbounds = Vec::new();
+
+        if let Some(packet) = self.received_bytes(bytes)? {
+            outbounds.push(packet);
+        }
+
+        let (packets, event, other) = self.handle_message(payload)?;
+        outbounds.extend(packets);
+        Ok((outbounds, event, other))
+    }
+
+    // Handle a received message, re-organized returned values.
+    // Returns a elements tuple:
+    // `(responses, event, unhandleable_message_payload): (Vec<Packet>, Option<ClientSessionEvent>, Option<MessagePayload>)`
+    fn handle_message(&mut self, payload: MessagePayload)
+        -> Result<(Vec<Packet>, Option<ClientSessionEvent>, Option<MessagePayload>), ClientSessionError>
+    {
+        let message = payload.to_rtmp_message()?;
+        let message_results = match message {
+            RtmpMessage::Acknowledgement {sequence_number} => {
+                let event = self.handle_acknowledgement(sequence_number)?;
+                (vec![], Some(event), None)
+            }
+
+            RtmpMessage::Amf0Command {command_name, transaction_id, command_object, additional_arguments} => {
+                let (packets, event) = self.handle_amf0_command(command_name, transaction_id, command_object, additional_arguments)?;
+                (packets, event, None)
+            }
+
+            RtmpMessage::Amf0Data {values} => {
+                let event = self.handle_amf0_data(values, payload.message_stream_id);
+                (vec![], event, None)
+            }
+
+            RtmpMessage::AudioData {data} => {
+                let event = self.handle_audio_data(payload.message_stream_id, data, payload.timestamp)?;
+                (vec![], event, None)
+            }
+
+            RtmpMessage::VideoData {data} => {
+                let event = self.handle_video_data(payload.message_stream_id, data, payload.timestamp)?;
+                (vec![], event, None)
+            }
+
+            RtmpMessage::UserControl {event_type, timestamp, stream_id, buffer_length} => {
+                match self.handle_user_control(event_type, timestamp, stream_id, buffer_length)? {
+                    Some(ClientSessionResult::OutboundResponse(packet)) => (vec![packet], None, None),
+                    Some(ClientSessionResult::RaisedEvent(event)) => (vec![], Some(event), None),
+                    Some(ClientSessionResult::UnhandleableMessageReceived(payload)) => (vec![], None, Some(payload)),
+                    None => (vec![], None, None),
+                }
+            }
+
+            RtmpMessage::WindowAcknowledgement {size} => {
+                self.handle_window_ack_size(size);
+                (vec![], None, None)
+            }
+
+            RtmpMessage::SetChunkSize{size} => {
+                self.handle_set_chunk_size(size)?;
+                (vec![], None, None)
+            }
+
+            _ => (vec![], None, Some(payload))
+        };
+
+        Ok(message_results)
+    }
+
     /// Forms an RTMP message requesting a connection to the specified application on the server.
     /// An event will be raised when the request is accepted or rejected.
-    pub fn request_connection(&mut self, app_name: String) -> Result<ClientSessionResult, ClientSessionError> {
+    pub fn request_connection(&mut self, app_name: String, tc_url: Option<String>) -> Result<Packet, ClientSessionError> {
         match self.current_state {
             ClientState::Disconnected => (),
             _ => {
@@ -172,6 +220,9 @@ impl ClientSession {
         properties.insert("app".to_string(), Amf0Value::Utf8String(app_name));
         properties.insert("flashVer".to_string(), Amf0Value::Utf8String(self.config.flash_version.clone()));
         properties.insert("objectEncoding".to_string(), Amf0Value::Number(0.0));
+        if let Some(tc_url) = tc_url {
+            properties.insert("tcUrl".to_string(), Amf0Value::Utf8String(tc_url));
+        }
 
         let message = RtmpMessage::Amf0Command {
             command_name: "connect".to_string(),
@@ -183,7 +234,7 @@ impl ClientSession {
         let payload = message.into_message_payload(self.get_epoch(), 0)?;
         let packet = self.serializer.serialize(&payload, false, false)?;
 
-        Ok(ClientSessionResult::OutboundResponse(packet))
+        Ok(packet)
     }
 
     /// Starts the process of requesting playback on the server for the specified stream key.  An
@@ -220,7 +271,7 @@ impl ClientSession {
 
     /// Starts the process of requesting to publish to the server on the specified stream key.  An
     /// event will be raised when the request is accepted or rejected.
-    pub fn request_publishing(&mut self, stream_key: String, publish_type: PublishRequestType) -> Result<ClientSessionResult, ClientSessionError> {
+    pub fn request_publishing(&mut self, stream_key: String, publish_type: PublishRequestType) -> Result<Vec<Packet>, ClientSessionError> {
         match self.current_state {
             ClientState::Connected => (),
             _ => {
@@ -229,6 +280,29 @@ impl ClientSession {
             }
         }
 
+        // 1. releaseStream
+        let transaction_id_1 = self.get_next_transaction_id();
+        let message_1 = RtmpMessage::Amf0Command {
+            command_name: "releaseStream".to_string(),
+            transaction_id: transaction_id_1 as f64,
+            command_object: Amf0Value::Null,
+            additional_arguments: vec![Amf0Value::Utf8String(stream_key.clone())],
+        };
+        let payload_1 = message_1.into_message_payload(self.get_epoch(), 0)?;
+        let packet_1 = self.serializer.serialize(&payload_1, false, false)?;
+
+        // 2. FCPublish
+        let transaction_id_2 = self.get_next_transaction_id();
+        let message_2 = RtmpMessage::Amf0Command {
+            command_name: "FCPublish".to_string(),
+            transaction_id: transaction_id_2 as f64,
+            command_object: Amf0Value::Null,
+            additional_arguments: vec![Amf0Value::Utf8String(stream_key.clone())],
+        };
+        let payload_2 = message_2.into_message_payload(self.get_epoch(), 0)?;
+        let packet_2 = self.serializer.serialize(&payload_2, false, false)?;
+
+        // 3. createStream
         let transaction_id = self.get_next_transaction_id();
         let transaction = OutstandingTransaction::CreateStream {
             purpose: TransactionPurpose::PublishRequest {
@@ -249,7 +323,7 @@ impl ClientSession {
         let payload = message.into_message_payload(self.get_epoch(), 0)?;
         let packet = self.serializer.serialize(&payload, false, false)?;
 
-        Ok(ClientSessionResult::OutboundResponse(packet))
+        Ok(vec![packet_1, packet_2, packet])
     }
 
     /// If currently playing on a stream key, this is used to tell the server we no longer want to
@@ -325,7 +399,7 @@ impl ClientSession {
 
     /// If publishing, this allows us to send encoder metadata to the server to send to all
     /// players.
-    pub fn publish_metadata(&mut self, metadata: &StreamMetadata) -> Result<ClientSessionResult, ClientSessionError> {
+    pub fn publish_metadata(&mut self, metadata: &StreamMetadata) -> Result<Packet, ClientSessionError> {
         match self.current_state {
             ClientState::Publishing => (),
             _ => {
@@ -342,67 +416,23 @@ impl ClientSession {
             }
         };
 
-        let mut properties = HashMap::new();
-        if let Some(x) = metadata.video_width {
-            properties.insert("width".to_string(), Amf0Value::Number(x as f64));
-        }
-
-        if let Some(x) = metadata.video_height {
-            properties.insert("height".to_string(), Amf0Value::Number(x as f64));
-        }
-
-        if let Some(ref x) = metadata.video_codec {
-            properties.insert("videocodecid".to_string(), Amf0Value::Utf8String(x.clone()));
-        }
-
-        if let Some(x) = metadata.video_frame_rate {
-            properties.insert("framerate".to_string(), Amf0Value::Number(x as f64));
-        }
-
-        if let Some(x) = metadata.video_bitrate_kbps {
-            properties.insert("videodatarate".to_string(), Amf0Value::Number(x as f64));
-        }
-
-        if let Some(ref x) = metadata.audio_codec {
-            properties.insert("audiocodecid".to_string(), Amf0Value::Utf8String(x.clone()));
-        }
-
-        if let Some(x) = metadata.audio_bitrate_kbps {
-            properties.insert("audiodatarate".to_string(), Amf0Value::Number(x as f64));
-        }
-
-        if let Some(x) = metadata.audio_sample_rate {
-            properties.insert("audiosamplerate".to_string(), Amf0Value::Number(x as f64));
-        }
-
-        if let Some(x) = metadata.audio_channels {
-            properties.insert("audiochannels".to_string(), Amf0Value::Number(x as f64));
-        }
-
-        if let Some(x) = metadata.audio_is_stereo {
-            properties.insert("stereo".to_string(), Amf0Value::Boolean(x));
-        }
-
-        if let Some(ref x) = metadata.encoder {
-            properties.insert("encoder".to_string(), Amf0Value::Utf8String(x.clone()));
-        }
-
+        let metadata = metadata.to_amf_value();
         let message = RtmpMessage::Amf0Data {
             values: vec![
                 Amf0Value::Utf8String("@setDataFrame".to_string()),
                 Amf0Value::Utf8String("onMetaData".to_string()),
-                Amf0Value::Object(properties),
+                metadata,
             ]
         };
 
         let payload = message.into_message_payload(self.get_epoch(), active_stream_id)?;
         let packet = self.serializer.serialize(&payload, false, false)?;
 
-        Ok(ClientSessionResult::OutboundResponse(packet))
+        Ok(packet)
     }
 
     /// If publishing, this allows us to send video data to the server on the publishing stream.
-    pub fn publish_video_data(&mut self, data: Bytes, timestamp: RtmpTimestamp, can_be_dropped: bool) -> Result<ClientSessionResult, ClientSessionError> {
+    pub fn publish_video_data(&mut self, data: Bytes, timestamp: RtmpTimestamp, can_be_dropped: bool) -> Result<Packet, ClientSessionError> {
         match self.current_state {
             ClientState::Publishing => (),
             _ => {
@@ -422,11 +452,11 @@ impl ClientSession {
         let message = RtmpMessage::VideoData {data};
         let payload = message.into_message_payload(timestamp, active_stream_id)?;
         let packet = self.serializer.serialize(&payload, false, can_be_dropped)?;
-        Ok(ClientSessionResult::OutboundResponse(packet))
+        Ok(packet)
     }
 
     /// If publishing, this allows us to send audio data to the server on the publishing stream.
-    pub fn publish_audio_data(&mut self, data: Bytes, timestamp: RtmpTimestamp, can_be_dropped: bool) -> Result<ClientSessionResult, ClientSessionError> {
+    pub fn publish_audio_data(&mut self, data: Bytes, timestamp: RtmpTimestamp, can_be_dropped: bool) -> Result<Packet, ClientSessionError> {
         match self.current_state {
             ClientState::Publishing => (),
             _ => {
@@ -446,10 +476,10 @@ impl ClientSession {
         let message = RtmpMessage::AudioData {data};
         let payload = message.into_message_payload(timestamp, active_stream_id)?;
         let packet = self.serializer.serialize(&payload, false, can_be_dropped)?;
-        Ok(ClientSessionResult::OutboundResponse(packet))
+        Ok(packet)
     }
 
-    fn handle_video_data(&self, stream_id: u32, data: Bytes, timestamp: RtmpTimestamp) -> ClientResult {
+    fn handle_video_data(&self, stream_id: u32, data: Bytes, timestamp: RtmpTimestamp) -> Result<Option<ClientSessionEvent>, ClientSessionError> {
         // PlayRequested state is allowed because some servers send video data prior to the
         // `NetStream.Play.Start` command.
         match self.current_state {
@@ -463,16 +493,16 @@ impl ClientSession {
 
         // Validate we are active on the stream this message came from
         match self.active_stream_id {
-            None => return Ok(Vec::new()), // not active on any stream
-            Some(active_stream_id) if active_stream_id != stream_id => return Ok(Vec::new()), // not active on this stream
+            None => return Ok(None), // not active on any stream
+            Some(active_stream_id) if active_stream_id != stream_id => return Ok(None), // not active on this stream
             Some(_) => (),
         }
 
         let event = ClientSessionEvent::VideoDataReceived {data, timestamp};
-        Ok(vec![ClientSessionResult::RaisedEvent(event)])
+        Ok(Some(event))
     }
 
-    fn handle_audio_data(&self, stream_id: u32, data: Bytes, timestamp: RtmpTimestamp) -> ClientResult {
+    fn handle_audio_data(&self, stream_id: u32, data: Bytes, timestamp: RtmpTimestamp) -> Result<Option<ClientSessionEvent>, ClientSessionError> {
         // PlayRequested state is allowed because some servers send audio data prior to the
         // `NetStream.Play.Start` command.
         match self.current_state {
@@ -486,25 +516,25 @@ impl ClientSession {
 
         // Validate we are active on the stream this message came from
         match self.active_stream_id {
-            None => return Ok(Vec::new()), // not active on any stream
-            Some(active_stream_id) if active_stream_id != stream_id => return Ok(Vec::new()), // not active on this stream
+            None => return Ok(None), // not active on any stream
+            Some(active_stream_id) if active_stream_id != stream_id => return Ok(None), // not active on this stream
             Some(_) => (),
         }
 
         let event = ClientSessionEvent::AudioDataReceived {data, timestamp};
-        Ok(vec![ClientSessionResult::RaisedEvent(event)])
+        Ok(Some(event))
     }
 
-    fn handle_amf0_data(&mut self, mut data: Vec<Amf0Value>, stream_id: u32) -> ClientResult {
+    fn handle_amf0_data(&mut self, mut data: Vec<Amf0Value>, stream_id: u32) -> Option<ClientSessionEvent> {
         if data.len() == 0 {
             // No data so just do nothing
-            return Ok(Vec::new());
+            return None;
         }
 
         // Validate we are active on the stream this message came from
         match self.active_stream_id {
-            None => return Ok(Vec::new()), // not active on any stream
-            Some(active_stream_id) if active_stream_id != stream_id => return Ok(Vec::new()), // not active on this stream
+            None => return None, // not active on any stream
+            Some(active_stream_id) if active_stream_id != stream_id => return None, // not active on this stream
             Some(_) => (),
         }
 
@@ -513,7 +543,7 @@ impl ClientSession {
             Amf0Value::Utf8String(ref value) if value == "onMetaData"
                 => self.handle_amf0_data_on_meta_data(data),
 
-            _ => Ok(Vec::new()),
+            _ => None,
         }
     }
 
@@ -521,12 +551,19 @@ impl ClientSession {
                            name: String,
                            transaction_id: f64,
                            command_object: Amf0Value,
-                           additional_args: Vec<Amf0Value>) -> ClientResult {
+                           additional_args: Vec<Amf0Value>)
+        -> Result<(Vec<Packet>, Option<ClientSessionEvent>), ClientSessionError>
+    {
         match name.as_str() {
             "_result" => self.handle_amf0_command_success_result(transaction_id, command_object, additional_args),
-            "_error" => self.handle_amf0_command_failed_result(transaction_id, command_object, additional_args),
-            "onStatus" => self.handle_on_status_command(additional_args),
-
+            "_error" => {
+                let event = self.handle_amf0_command_failed_result(transaction_id, command_object, additional_args)?;
+                Ok((vec![], Some(event)))
+            }
+            "onStatus" => {
+                let event = self.handle_on_status_command(additional_args)?;
+                Ok((vec![], Some(event)))
+            }
             _ => {
                 let event = ClientSessionEvent::UnhandleableAmf0Command {
                     command_name: name,
@@ -535,7 +572,7 @@ impl ClientSession {
                     transaction_id,
                 };
 
-                Ok(vec![ClientSessionResult::RaisedEvent(event)])
+                Ok((vec![], Some(event)))
             }
         }
     }
@@ -543,7 +580,9 @@ impl ClientSession {
     fn handle_amf0_command_failed_result(&mut self,
                                          transaction_id: f64,
                                          command_object: Amf0Value,
-                                         mut additional_args: Vec<Amf0Value>) -> ClientResult {
+                                         mut additional_args: Vec<Amf0Value>)
+        -> Result<ClientSessionEvent, ClientSessionError>
+    {
         let outstanding_transaction = match self.outstanding_transactions.remove(&(transaction_id as u32)) {
             Some(transaction) => transaction,
             None => {
@@ -553,7 +592,7 @@ impl ClientSession {
                     transaction_id,
                 };
 
-                return Ok(vec![ClientSessionResult::RaisedEvent(event)]);
+                return Ok(event)
             },
         };
 
@@ -574,7 +613,7 @@ impl ClientSession {
                 };
 
                 let event = ClientSessionEvent::ConnectionRequestRejected {description};
-                Ok(vec![ClientSessionResult::RaisedEvent(event)])
+                Ok(event)
             },
 
             OutstandingTransaction::CreateStream {purpose: _} => {
@@ -587,7 +626,9 @@ impl ClientSession {
     fn handle_amf0_command_success_result(&mut self,
                                           transaction_id: f64,
                                           command_object: Amf0Value,
-                                          additional_args: Vec<Amf0Value>) -> ClientResult {
+                                          additional_args: Vec<Amf0Value>)
+        -> Result<(Vec<Packet>, Option<ClientSessionEvent>), ClientSessionError>
+    {
         let outstanding_transaction = match self.outstanding_transactions.remove(&(transaction_id as u32)) {
             Some(transaction) => transaction,
             None => {
@@ -597,7 +638,7 @@ impl ClientSession {
                     transaction_id,
                 };
 
-                return Ok(vec![ClientSessionResult::RaisedEvent(event)]);
+                return Ok((vec![], Some(event)));
             },
         };
 
@@ -610,10 +651,7 @@ impl ClientSession {
                 let payload = message.into_message_payload(self.get_epoch(), 0)?;
                 let packet = self.serializer.serialize(&payload, false, false)?;
                 let event = ClientSessionEvent::ConnectionRequestAccepted;
-                Ok(vec![
-                    ClientSessionResult::OutboundResponse(packet),
-                    ClientSessionResult::RaisedEvent(event)],
-                )
+                Ok((vec![packet], Some(event)))
             },
 
             OutstandingTransaction::CreateStream {purpose} => {
@@ -656,10 +694,8 @@ impl ClientSession {
                         let play_payload = play_message.into_message_payload(self.get_epoch(), stream_id)?;
                         let play_packet = self.serializer.serialize(&play_payload, false, false)?;
 
-                        Ok(vec![
-                            ClientSessionResult::OutboundResponse(buffer_packet),
-                            ClientSessionResult::OutboundResponse(play_packet),
-                        ])
+                        let packets = vec![buffer_packet, play_packet];
+                        Ok((packets, None))
                     },
 
                     TransactionPurpose::PublishRequest {stream_key, request_type} => {
@@ -683,14 +719,16 @@ impl ClientSession {
 
                         let publish_payload = publish_message.into_message_payload(self.get_epoch(), stream_id)?;
                         let publish_packet = self.serializer.serialize(&publish_payload, false, false)?;
-                        Ok(vec![ClientSessionResult::OutboundResponse(publish_packet)])
+                        Ok((vec![publish_packet], None))
                     },
                 }
             },
         }
     }
 
-    fn handle_on_status_command(&mut self, mut arguments: Vec<Amf0Value>) -> ClientResult {
+    fn handle_on_status_command(&mut self, mut arguments: Vec<Amf0Value>) -> Result<ClientSessionEvent, ClientSessionError> {
+        println!("onStatus received arguments: {:?}", arguments);
+
         if arguments.len() < 1 {
             let kind = ClientSessionErrorKind::InvalidOnStatusArguments;
             return Err(ClientSessionError {kind});
@@ -708,9 +746,9 @@ impl ClientSession {
             Some(Amf0Value::Utf8String(code)) => code,
 
             _ => {
-        let kind = ClientSessionErrorKind::InvalidOnStatusArguments;
-        return Err(ClientSessionError {kind});
-        }
+                let kind = ClientSessionErrorKind::InvalidOnStatusArguments;
+                return Err(ClientSessionError {kind});
+            }
         };
 
         match code.as_ref() {
@@ -719,12 +757,12 @@ impl ClientSession {
 
             x => {
                 let event = ClientSessionEvent::UnhandleableOnStatusCode {code: x.to_string()};
-                Ok(vec![ClientSessionResult::RaisedEvent(event)])
+                Ok(event)
             }
         }
     }
 
-    fn handle_play_start(&mut self) -> ClientResult {
+    fn handle_play_start(&mut self) -> Result<ClientSessionEvent, ClientSessionError> {
         match self.current_state {
             ClientState::PlayRequested => (),
             _ => {
@@ -736,10 +774,10 @@ impl ClientSession {
         self.current_state = ClientState::Playing;
 
         let event = ClientSessionEvent::PlaybackRequestAccepted;
-        Ok(vec![ClientSessionResult::RaisedEvent(event)])
+        Ok(event)
     }
 
-    fn handle_publish_start(&mut self) -> ClientResult {
+    fn handle_publish_start(&mut self) -> Result<ClientSessionEvent, ClientSessionError> {
         match self.current_state {
             ClientState::PublishRequested => (),
             _ => {
@@ -750,50 +788,56 @@ impl ClientSession {
 
         self.current_state = ClientState::Publishing;
         let event = ClientSessionEvent::PublishRequestAccepted;
-        Ok(vec![ClientSessionResult::RaisedEvent(event)])
+        Ok(event)
     }
 
-    fn handle_amf0_data_on_meta_data(&mut self, mut data: Vec<Amf0Value>) -> ClientResult {
+    fn handle_amf0_data_on_meta_data(&mut self, mut data: Vec<Amf0Value>) -> Option<ClientSessionEvent> {
         if data.len() < 1 {
             // No data so ignore it
-            return Ok(Vec::new());
+            return None;
         }
 
         let properties = match data.remove(0) {
             Amf0Value::Object(properties) => properties,
-            _ => return Ok(Vec::new()), // malformed so ignore it
+            _ => return None, // malformed so ignore it
         };
 
         let mut metadata = StreamMetadata::new();
         metadata.apply_metadata_values(properties);
 
-        let event = ClientSessionEvent::StreamMetadataReceived {metadata};
-        Ok(vec![ClientSessionResult::RaisedEvent(event)])
+        Some(ClientSessionEvent::StreamMetadataReceived {metadata})
     }
 
-    fn handle_acknowledgement(&mut self, sequence_number: u32) -> ClientResult {
+    fn handle_acknowledgement(&mut self, sequence_number: u32) -> Result<ClientSessionEvent, ClientSessionError> {
         let event = ClientSessionEvent::AcknowledgementReceived {bytes_received: sequence_number};
-        Ok(vec![ClientSessionResult::RaisedEvent(event)])
+        Ok(event)
     }
 
-    fn handle_window_ack_size(&mut self, size: u32) -> ClientResult {
+    fn handle_window_ack_size(&mut self, size: u32) {
         self.peer_window_ack_size = Some(size);
-        Ok(Vec::new())
     }
 
     fn handle_user_control(&mut self,
                            event_type: UserControlEventType,
                            timestamp: Option<RtmpTimestamp>,
                            _stream_id: Option<u32>,
-                           _buffer_length: Option<u32>) -> ClientResult {
+                           _buffer_length: Option<u32>)
+        -> Result<Option<ClientSessionResult>, ClientSessionError>
+    {
         match event_type {
-            UserControlEventType::PingRequest => self.handle_ping_request(timestamp),
-            UserControlEventType::PingResponse => self.handle_ping_response(timestamp),
-            _ => Ok(Vec::new()),
+            UserControlEventType::PingRequest => {
+                let response = self.handle_ping_request(timestamp)?;
+                Ok(Some(ClientSessionResult::OutboundResponse(response)))
+            }
+            UserControlEventType::PingResponse => {
+                let event = self.handle_ping_response(timestamp);
+                Ok(Some(ClientSessionResult::RaisedEvent(event)))
+            }
+            _ => Ok(None),
         }
     }
 
-    fn handle_ping_request(&mut self, timestamp: Option<RtmpTimestamp>) -> ClientResult {
+    fn handle_ping_request(&mut self, timestamp: Option<RtmpTimestamp>) -> Result<Packet, ClientSessionError> {
         let message = RtmpMessage::UserControl {
             event_type: UserControlEventType::PingResponse,
             buffer_length: None,
@@ -803,18 +847,16 @@ impl ClientSession {
 
         let payload = message.into_message_payload(self.get_epoch(), 0)?;
         let packet = self.serializer.serialize(&payload, false, false)?;
-        Ok(vec![ClientSessionResult::OutboundResponse(packet)])
+        Ok(packet)
     }
 
-    fn handle_ping_response(&mut self, timestamp: Option<RtmpTimestamp>) -> ClientResult {
+    fn handle_ping_response(&mut self, timestamp: Option<RtmpTimestamp>) -> ClientSessionEvent {
         let timestamp = timestamp.unwrap_or(RtmpTimestamp::new(0));
-        let event = ClientSessionEvent::PingResponseReceived {timestamp};
-        Ok(vec![ClientSessionResult::RaisedEvent(event)])
+        ClientSessionEvent::PingResponseReceived {timestamp}
     }
 
-    fn handle_set_chunk_size(&mut self, size: u32) -> ClientResult {
-        self.deserializer.set_max_chunk_size(size as usize)?;
-        Ok(Vec::new())
+    fn handle_set_chunk_size(&mut self, size: u32) -> Result<(), ClientSessionError> {
+        self.deserializer.set_max_chunk_size(size as usize).map_err(From::from)
     }
 
     fn get_epoch(&self) -> RtmpTimestamp {
@@ -835,5 +877,24 @@ impl ClientSession {
         let transaction_id = self.next_transaction_id;
         self.next_transaction_id += 1;
         transaction_id
+    }
+
+    // Accumulate received bytes, return Acknowledgement if necessary
+    fn received_bytes(&mut self, bytes_len: usize) -> Result<Option<Packet>, ClientSessionError> {
+        self.bytes_received += bytes_len as u64;
+
+        if let Some(peer_ack_size) = self.peer_window_ack_size {
+            self.bytes_received_since_last_ack += bytes_len as u32;
+            if self.bytes_received_since_last_ack >= peer_ack_size {
+                let ack_message = RtmpMessage::Acknowledgement {sequence_number: self.bytes_received_since_last_ack};
+                let ack_payload = ack_message.into_message_payload(self.get_epoch(), 0)?;
+                let ack_packet = self.serializer.serialize(&ack_payload, false, false)?;
+
+                self.bytes_received_since_last_ack = 0;
+                return Ok(Some(ack_packet));
+            }
+        }
+
+        Ok(None)
     }
 }
