@@ -10,7 +10,7 @@ This crate works with Cargo and is on [crates.io](http://crates.io).  Add it to 
 ```toml
 [dependencies]
 rml_amf0 = "0.1"
-``` 
+```
 
 ## Example
 
